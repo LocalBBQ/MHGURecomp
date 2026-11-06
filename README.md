@@ -77,7 +77,7 @@ You need Monster Hunter Generations Ultimate **1.4.0** (Title ID `0100770008DD80
 
 1. Extract the release zip anywhere, for example `C:\Games\MHGURecomp\`. Keep `hactool.exe` / `hactool` next to `mhgurecomp`.
 2. Have ready: the base game NSP, the **1.4.0** update NSP, and your own `prod.keys` (from your Switch; never share keys). `title.keys` is optional.
-3. Run **Extract MHGU NSP.bat** (Windows; needs Python 3.10+ with tkinter) or `python tools/extract_mhgu_nsp.py`, pick those files, and set the output folder to this release’s `data\` (or any folder, then copy `exefs`/`romfs` into `data\`). About **20 GB free** while extracting; original NSPs are not modified.
+3. Run **Extract MHGU NSP.bat** (Windows; needs Python 3.10+ with tkinter) or **Extract MHGU NSP.sh** (Linux; right-click → *Run as a Program*, or `./"Extract MHGU NSP.sh"` in a terminal; needs Python 3.10+ and tkinter, zenity or kdialog), pick those files, and set the output folder to this release’s `data\` (or any folder, then copy `exefs`/`romfs` into `data\`). About **20 GB free** while extracting; original NSPs are not modified.
 4. Start `mhgurecomp.exe`.
 
 (Optional) Set `MHGU_NSP_IMPORT=1` before launching to use in-app NSP file pickers instead of the extract GUI.

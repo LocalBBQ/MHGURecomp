@@ -18,11 +18,10 @@ import time
 import zipfile
 
 DATA_NOTE = ('Put your own dump of Monster Hunter Generations Ultimate 1.4.0 here: the exefs and romfs folders\n'
-             '(data/exefs/main, data/romfs/...). On Windows, run Extract MHGU NSP.bat (needs Python 3.10+ with\n'
-             'tkinter) with your base game NSP, 1.4.0 update NSP, and prod.keys; choose this data folder as output.\n'
-             'On Linux: python3 tools/extract_mhgu_nsp.py --cli --base game.nsp --update update.nsp\n'
-             '  --keys prod.keys --out data  (hactool is shipped beside the program).\n'
-             'Original NSPs are not modified.\n')
+             '(data/exefs/main, data/romfs/...). Or extract them from your NSPs: run Extract MHGU NSP.bat\n'
+             '(Windows, needs Python 3.10+ with tkinter) or Extract MHGU NSP.sh (Linux, needs Python 3.10+ and\n'
+             'tkinter, zenity or kdialog) with your base game NSP, 1.4.0 update NSP, and prod.keys; choose this\n'
+             'data folder as output. hactool is shipped beside the program. Original NSPs are not modified.\n')
 
 
 def files(build, platform):
@@ -55,11 +54,12 @@ def files(build, platform):
     if not os.path.isfile(extract_py):
         sys.exit(f'dist: {extract_py} is missing')
     out.append(('tools/extract_mhgu_nsp.py', extract_py, False))
-    if platform == 'windows':
-        bat = os.path.join(root, 'Extract MHGU NSP.bat')
-        if not os.path.isfile(bat):
-            sys.exit(f'dist: {bat} is missing')
-        out.append(('Extract MHGU NSP.bat', bat, False))
+    # (the NSP extract launcher: on Linux an executable shell script)
+    launcher = 'Extract MHGU NSP.bat' if platform == 'windows' else 'Extract MHGU NSP.sh'
+    p = os.path.join(root, launcher)
+    if not os.path.isfile(p):
+        sys.exit(f'dist: {p} is missing')
+    out.append((launcher, p, platform != 'windows'))
     return out
 
 

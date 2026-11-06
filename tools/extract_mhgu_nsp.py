@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Extract MHGU base + 1.4.0 update NSPs into exefs/ + romfs/ using build/hactool.
 
-Double-click Extract MHGU NSP.bat, or:
+Double-click Extract MHGU NSP.bat (Windows) or run Extract MHGU NSP.sh (Linux), or:
   python tools/extract_mhgu_nsp.py
   python tools/extract_mhgu_nsp.py --cli --base game.nsp --update update.nsp --keys prod.keys --out ../mhgu/game
 
@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -48,7 +49,16 @@ def find_hactool() -> Path:
               root / "hactool.exe", root / "hactool"):
         if p.is_file():
             return p
-    raise ExtractError("hactool not found.\nBuild it first in MSYS2 UCRT64:\n  make -j4 hactool")
+    raise ExtractError(
+        "hactool not found.\nIt ships next to mhgurecomp in the release; from source, build it first"
+        + (" in MSYS2 UCRT64" if os.name == "nt" else "") + ":\n  make -j4 hactool"
+    )
+
+
+def build_hint(out: Path) -> str:
+    """What a from-source checkout runs next with the extracted dump."""
+    where = " (MSYS2 UCRT64)" if os.name == "nt" else ""
+    return f"From source{where}, next:\n  make gen GAME={out.as_posix()}\n  make -j4 GAME={out.as_posix()}"
 
 
 def free_bytes(path: Path) -> int | None:
@@ -348,14 +358,7 @@ def extract_mhgu(
             )
 
         install_note = install_into_build_data(out)
-        say(
-            f"Done!\n\nFiles are in:\n{out}"
-            + (f"\n\n{install_note}" if install_note else "")
-            + (
-                f"\n\nFrom-source next (MSYS2 UCRT64), if you still need to compile:\n"
-                f"  make gen GAME={out.as_posix()}\n  make -j4 GAME={out.as_posix()}"
-            )
-        )
+        say(f"Done!\n\nFiles are in:\n{out}\n\n{install_note or build_hint(out)}")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -407,6 +410,11 @@ def install_into_build_data(game: Path) -> str:
     return "\n\n".join(notes)
 
 
+# Tk file-dialog patterns: case-sensitive off Windows, where "*.*" also skips names without a dot.
+NSP_FILES = "*.nsp" if os.name == "nt" else ("*.nsp", "*.NSP")
+ALL_FILES = "*.*" if os.name == "nt" else "*"
+
+
 def run_gui() -> None:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
@@ -431,7 +439,7 @@ def run_gui() -> None:
     busy = {"on": False}
 
     def browse_file(key: str, title: str, patterns: list[tuple[str, str]]) -> None:
-        p = filedialog.askopenfilename(parent=win, title=title, filetypes=patterns + [("All files", "*.*")])
+        p = filedialog.askopenfilename(parent=win, title=title, filetypes=patterns + [("All files", ALL_FILES)])
         if p:
             paths[key].set(p)
 
@@ -484,12 +492,7 @@ def run_gui() -> None:
             try:
                 extract_mhgu(base, update, keys, out, title_keys, progress=set_status)
                 install = install_into_build_data(out)
-                extra = f"\n\n{install}" if install else (
-                    f"\n\nThen in MSYS2 UCRT64:\n"
-                    f"make gen GAME={out.as_posix()}\n"
-                    f"make -j4 GAME={out.as_posix()}"
-                )
-                finish_ok(f"Extraction finished.\n\nOutput:\n{out}{extra}")
+                finish_ok(f"Extraction finished.\n\nOutput:\n{out}\n\n{install or build_hint(out)}")
             except ExtractError as e:
                 finish_err(str(e))
             except Exception:
@@ -519,8 +522,8 @@ def run_gui() -> None:
         ttk.Entry(r, textvariable=paths[key]).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
         ttk.Button(r, text="Browse…", width=10, command=browse).pack(side=tk.RIGHT)
 
-    add_row("Base game NSP", "base", lambda: browse_file("base", "Select base game NSP", [("NSP", "*.nsp")]))
-    add_row("1.4.0 update NSP", "update", lambda: browse_file("update", "Select 1.4.0 update NSP", [("NSP", "*.nsp")]))
+    add_row("Base game NSP", "base", lambda: browse_file("base", "Select base game NSP", [("NSP", NSP_FILES)]))
+    add_row("1.4.0 update NSP", "update", lambda: browse_file("update", "Select 1.4.0 update NSP", [("NSP", NSP_FILES)]))
     add_row("prod.keys", "keys", lambda: browse_file("keys", "Select prod.keys", [("Keys", "*.keys")]))
     add_row("title.keys (optional)", "title", lambda: browse_file("title", "Select title.keys (optional)", [("Keys", "*.keys")]))
     add_row("Output folder", "out", lambda: browse_dir("out", "Select output folder"))
@@ -556,6 +559,8 @@ def run_cli(argv: list[str] | None = None) -> int:
 
     if not args.base or not args.update or not args.keys or not args.out:
         ap.error("--cli needs --base --update --keys --out")
+    # Extract MHGU NSP.sh stops a cancelled run with SIGTERM: unwind, so hactool is killed and the work folder removed.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     try:
         extract_mhgu(args.base, args.update, args.keys, args.out, args.title_keys)
     except ExtractError as e:
