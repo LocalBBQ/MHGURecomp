@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import signal
 import struct
@@ -410,136 +411,602 @@ def install_into_build_data(game: Path) -> str:
     return "\n\n".join(notes)
 
 
+# --- The GUI: one window listing what is needed, checking each choice as it is made ------------------
+
+WINDOW_TITLE = "MHGU Recomp — Extract from NSP"
+INTRO = ("This copies the game files out of your own Monster Hunter Generations Ultimate dumps so "
+         "MHGU Recomp can run them. Choose the files below; each one is checked as you pick it. "
+         "Your NSP files are not changed.")
+
+# (key, title, what it is / how to recognise it, kind, required). Order is the order on screen.
+FIELDS = [
+    ("base", "1.  Base game NSP",
+     "The full game, about 12 GB. Its file name usually contains [0100770008DD8000][v0].", "nsp", True),
+    ("update", "2.  Update 1.4.0 NSP",
+     "The 1.4.0 update, about 200 MB. Its file name usually contains [0100770008DD8800][v262144].", "nsp", True),
+    ("keys", "3.  prod.keys",
+     "The keys dumped from your own Switch (for example with Lockpick_RCM). Never share this file.", "keys", True),
+    ("out", "4.  Where to put the game files",
+     "Keep this release's data folder so MHGU Recomp finds the game. About 20 GB must be free while extracting.",
+     "dir", True),
+    ("title", "Optional:  title.keys",
+     "Usually not needed (the NSPs carry their own keys). Leave it empty unless extracting fails on title keys.",
+     "keys", False),
+]
+FIELD_NAMES = {"base": "the base game NSP", "update": "the 1.4.0 update NSP", "keys": "prod.keys",
+               "out": "an output folder", "title": "title.keys"}
+
 # Tk file-dialog patterns: case-sensitive off Windows, where "*.*" also skips names without a dot.
 NSP_FILES = "*.nsp" if os.name == "nt" else ("*.nsp", "*.NSP")
 ALL_FILES = "*.*" if os.name == "nt" else "*"
+GAME_EXE = "mhgurecomp.exe" if os.name == "nt" else "mhgurecomp"
+STEP_RE = re.compile(r"^(\d)/5 (.*)")
 
 
-def run_gui() -> None:
+def default_output() -> Path:
+    """Release folder: straight into data/ next to mhgurecomp. Source tree: mhgu_game/."""
+    root = repo_root()
+    return root / "data" if (root / GAME_EXE).is_file() else root / "mhgu_game"
+
+
+def game_to_start(out: Path) -> Path | None:
+    """The mhgurecomp that now has the extracted game in its data/ folder, if any."""
+    root = repo_root()
+    for exe in (root / GAME_EXE, root / "build" / GAME_EXE):
+        if exe.is_file() and (exe.parent / "data" / "exefs" / "main").is_file():
+            return exe
+    return None
+
+
+def size_text(n: int) -> str:
+    if n >= 1024**4:
+        return f"{n / 1024**4:.1f} TB"
+    return f"{n / 1024**3:.1f} GB" if n >= 1024**3 else f"{n / 1024**2:.0f} MB"
+
+
+def check_field(key: str, values: dict[str, str]) -> tuple[str, str]:
+    """('ok' | 'warn' | 'bad' | 'empty', text) for one input of the GUI. 'bad' and 'empty' (when required) block Extract."""
+    v = values.get(key, "").strip()
+    if not v:
+        if key == "title":
+            return "ok", "Not used (that is fine)"
+        if key == "out":
+            return "bad", "Choose a folder"
+        return "empty", "Not chosen yet"
+    p = Path(v).expanduser()
+
+    if key == "out":
+        probe = p
+        while not probe.exists() and probe.parent != probe:
+            probe = probe.parent
+        if probe.exists() and not probe.is_dir():
+            return "bad", "This is a file, not a folder"
+        free = free_bytes(probe)
+        if free is not None and free < NEED_FREE:
+            return "bad", f"Only {size_text(free)} free here: about 20 GB is needed"
+        free_s = f"{size_text(free)} free" if free is not None else "free space unknown"
+        if (p / "exefs" / "main").is_file():
+            return "warn", f"Already has game files: they will be replaced ({free_s})"
+        return "ok", f"OK ({free_s})"
+
+    if not p.is_file():
+        return "bad", "File not found"
+    size = p.stat().st_size
+    name = p.name.upper()
+
+    if key == "base":
+        if size < 2 * 1024**3:
+            return "bad", f"This file is only {size_text(size)}: the base game is about 12 GB (the small one is the update)"
+        if "0100770008DD8800" in name:
+            return "warn", "The name says this is the update, not the base game"
+        return "ok", f"Base game NSP ({size_text(size)})"
+
+    if key == "update":
+        base = values.get("base", "").strip()
+        if base and Path(base).expanduser().resolve() == p.resolve():
+            return "bad", "This is the same file as the base game: pick the small update NSP"
+        if size > 2 * 1024**3:
+            return "bad", f"This file is {size_text(size)}: the update is about 200 MB (the big one is the base game)"
+        m = re.search(r"\[V(\d+)\]", name)
+        if m and int(m.group(1)) != CNMT_VERSION:
+            return "warn", f"The name says update v{m.group(1)}: version 1.4.0 is v{CNMT_VERSION}"
+        return "ok", f"Update NSP ({size_text(size)})"
+
+    # prod.keys / title.keys: small text files of "name = hex" lines.
+    if size > 1024**2:
+        return "bad", f"This file is {size_text(size)}: a keys file is a few KB"
+    try:
+        text = p.read_text(errors="replace").lower()
+    except OSError as e:
+        return "bad", f"Cannot read it: {e.strerror}"
+    if key == "keys":
+        if "header_key" not in text:
+            if "title.keys" in p.name.lower() or re.search(r"^[0-9a-f]{32}\s*=", text, re.M):
+                return "bad", "This is title.keys: pick prod.keys (it holds header_key)"
+            return "bad", "This does not look like prod.keys (it has no header_key line)"
+        return "ok", "Keys file found"
+    if not re.search(r"^[0-9a-f]{32}\s*=", text, re.M):
+        return "warn", "This does not look like title.keys (no rights-ID lines)"
+    return "ok", "Title keys found"
+
+
+def gui_blockers(values: dict[str, str]) -> list[str]:
+    """What still stops Extract, as phrases for the window's bottom line."""
+    missing, wrong = [], []
+    for key, _, _, _, required in FIELDS:
+        level, _ = check_field(key, values)
+        if level == "bad":
+            wrong.append(FIELD_NAMES[key])
+        elif level == "empty" and required:
+            missing.append(FIELD_NAMES[key])
+    return missing + wrong
+
+
+def gui_summary(values: dict[str, str]) -> tuple[str, str]:
+    """(level, text) of the window's bottom line: what is left to do, or ready."""
+    missing = [FIELD_NAMES[k] for k, _, _, _, req in FIELDS if req and check_field(k, values)[0] == "empty"]
+    wrong = [FIELD_NAMES[k] for k, *_ in FIELDS if check_field(k, values)[0] == "bad"]
+    parts = []
+    if missing:
+        parts.append("Still needed: " + ", ".join(missing) + ".")
+    if wrong:
+        parts.append("Check " + ", ".join(wrong) + " (marked ✖ above).")
+    if parts:
+        return ("bad" if wrong else "empty"), "  ".join(parts)
+    return "ok", "Ready. Click Extract: it takes a few minutes."
+
+
+def output_error(lines: list[str]) -> str:
+    """The failure message in the --cli child's output: its 'Error: …' block, else a traceback, else the tail."""
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].startswith("Error: "):
+            return "\n".join([lines[i][len("Error: "):]] + lines[i + 1:]).strip()
+    for i, line in enumerate(lines):
+        if line.startswith("Traceback"):
+            return "\n".join(lines[i:])[-2000:]
+    return "\n".join(lines[-15:]).strip() or "The extract stopped without a message."
+
+
+def gtk_available() -> bool:
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gtk  # noqa: F401
+    except (ImportError, ValueError):
+        return False
+    return True
+
+
+def run_gtk() -> None:
+    """The window on Linux desktops: GTK 3 through PyGObject, which GNOME/KDE distributions ship by default."""
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import GLib, Gtk, Pango
+
+    ok, _ = Gtk.init_check(sys.argv)
+    if not ok:
+        raise RuntimeError("no display for GTK")
+
+    esc = GLib.markup_escape_text
+    colors = {"ok": "#26a269", "warn": "#e5a50a", "bad": "#e01b24", "empty": "#888a85"}
+    marks = {"ok": "✔", "warn": "⚠", "bad": "✖", "empty": "○"}
+    values = {key: "" for key, *_ in FIELDS}
+    values["out"] = str(default_output())
+    state = {"proc": None, "cancelled": False, "lines": [], "last_dir": str(Path.home())}
+
+    try:
+        hactool_error = ""
+        find_hactool()
+    except ExtractError as e:
+        hactool_error = str(e)
+
+    win = Gtk.Window(title=WINDOW_TITLE)
+    win.set_default_size(760, -1)
+    header = Gtk.HeaderBar(title="Extract MHGU from NSP", subtitle="Monster Hunter Generations Ultimate 1.4.0")
+    header.set_show_close_button(True)
+    win.set_titlebar(header)
+
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+    for side in ("top", "bottom", "start", "end"):
+        getattr(outer, f"set_margin_{side}")(18)
+    win.add(outer)
+
+    intro = Gtk.Label(label=INTRO, xalign=0)
+    intro.set_line_wrap(True)
+    intro.set_max_width_chars(80)
+    outer.pack_start(intro, False, False, 0)
+
+    if hactool_error:
+        bar = Gtk.InfoBar(message_type=Gtk.MessageType.ERROR)
+        bar.get_content_area().add(Gtk.Label(label=hactool_error, xalign=0))
+        outer.pack_start(bar, False, False, 0)
+
+    listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+    frame = Gtk.Frame()
+    frame.add(listbox)
+    outer.pack_start(frame, False, False, 0)
+
+    entries: dict[str, Gtk.Entry] = {}
+    status_labels: dict[str, Gtk.Label] = {}
+
+    def choose(key: str, kind: str, title: str) -> None:
+        action = Gtk.FileChooserAction.SELECT_FOLDER if kind == "dir" else Gtk.FileChooserAction.OPEN
+        dlg = Gtk.FileChooserNative.new(title, win, action, "_Select", "_Cancel")
+        current = values[key].strip()
+        start = Path(current).expanduser() if current else Path(state["last_dir"])
+        folder = start.parent if start.is_file() else start
+        while not folder.is_dir() and folder.parent != folder:  # (a folder still to be made: its nearest parent)
+            folder = folder.parent
+        if folder.is_dir():
+            dlg.set_current_folder(str(folder))
+        if kind != "dir":
+            f = Gtk.FileFilter()
+            if kind == "nsp":
+                f.set_name("NSP files (*.nsp)")
+                f.add_pattern("*.nsp")
+                f.add_pattern("*.NSP")
+            else:
+                f.set_name("Keys files (*.keys)")
+                f.add_pattern("*.keys")
+            dlg.add_filter(f)
+            every = Gtk.FileFilter()
+            every.set_name("All files")
+            every.add_pattern("*")
+            dlg.add_filter(every)
+        if dlg.run() == Gtk.ResponseType.ACCEPT and dlg.get_filename():
+            picked = dlg.get_filename()
+            entries[key].set_text(picked)
+            entries[key].set_position(-1)  # (long paths: show the file name end)
+            state["last_dir"] = picked if kind == "dir" else str(Path(picked).parent)
+        dlg.destroy()
+
+    for key, title, hint, kind, _required in FIELDS:
+        row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(row, f"set_margin_{side}")(12)
+        top = Gtk.Box(spacing=12)
+        name = Gtk.Label(xalign=0)
+        name.set_markup(f"<b>{esc(title, -1)}</b>")
+        top.pack_start(name, False, False, 0)
+        row.pack_start(top, False, False, 0)
+        desc = Gtk.Label(label=hint, xalign=0)
+        desc.set_line_wrap(True)
+        desc.set_max_width_chars(90)
+        desc.get_style_context().add_class("dim-label")
+        row.pack_start(desc, False, False, 0)
+        line = Gtk.Box(spacing=6)
+        entry = Gtk.Entry(text=values[key], hexpand=True)
+        entry.set_placeholder_text("Not used" if key == "title" else "Click Choose… to pick it")
+        line.pack_start(entry, True, True, 0)
+        btn = Gtk.Button(label="Choose folder…" if kind == "dir" else "Choose file…")
+        btn.connect("clicked", lambda _b, k=key, kd=kind, t=title: choose(k, kd, t.split("  ", 1)[-1]))
+        line.pack_start(btn, False, False, 0)
+        row.pack_start(line, False, False, 0)
+        st = Gtk.Label(xalign=0)
+        st.set_line_wrap(True)
+        st.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        st.set_max_width_chars(90)
+        row.pack_start(st, False, False, 0)
+        listbox.add(row)
+        entries[key] = entry
+        status_labels[key] = st
+
+    progress = Gtk.ProgressBar(show_text=True)
+    progress.set_no_show_all(True)
+    outer.pack_start(progress, False, False, 0)
+
+    bottom = Gtk.Box(spacing=10)
+    spinner = Gtk.Spinner()
+    bottom.pack_start(spinner, False, False, 0)
+    footer = Gtk.Label(xalign=0)
+    footer.set_line_wrap(True)
+    footer.set_selectable(True)
+    bottom.pack_start(footer, True, True, 0)
+    start_btn = Gtk.Button(label="Start MHGU Recomp")
+    start_btn.get_style_context().add_class("suggested-action")
+    start_btn.set_no_show_all(True)
+    cancel_btn = Gtk.Button(label="Cancel")
+    cancel_btn.get_style_context().add_class("destructive-action")
+    cancel_btn.set_no_show_all(True)
+    extract_btn = Gtk.Button(label="Extract")
+    extract_btn.get_style_context().add_class("suggested-action")
+    for b in (extract_btn, cancel_btn, start_btn):
+        b.set_size_request(120, -1)
+        bottom.pack_end(b, False, False, 0)
+    outer.pack_start(bottom, False, False, 0)
+
+    def set_footer(text: str, level: str | None = None) -> None:
+        if level:
+            footer.set_markup(f'<span foreground="{colors[level]}">{marks[level]}</span>  {esc(text, -1)}')
+        else:
+            footer.set_text(text)
+
+    def refresh(*_args) -> None:
+        if state["proc"]:
+            return
+        for key, *_ in FIELDS:
+            values[key] = entries[key].get_text()
+        for key, *_ in FIELDS:
+            level, text = check_field(key, values)
+            status_labels[key].set_markup(
+                f'<span foreground="{colors[level]}" weight="bold">{marks[level]}  {esc(text, -1)}</span>')
+        level, text = gui_summary(values)
+        extract_btn.set_sensitive(level == "ok" and not hactool_error)
+        if hactool_error:
+            set_footer("hactool is missing (see above): extracting needs it.", "bad")
+        else:
+            set_footer(text, level)
+
+    for e in entries.values():
+        e.connect("changed", refresh)
+
+    def set_running(on: bool) -> None:
+        listbox.set_sensitive(not on)
+        extract_btn.set_visible(not on)
+        cancel_btn.set_visible(on)
+        cancel_btn.set_sensitive(True)
+        (spinner.start if on else spinner.stop)()
+        if on:
+            progress.set_fraction(0.0)
+            progress.set_text("Starting…")
+            progress.show()
+
+    def on_line(line: str) -> bool:
+        state["lines"].append(line)
+        m = STEP_RE.match(line)
+        if m:
+            k = int(m.group(1))
+            progress.set_fraction((k - 1) / 5)
+            progress.set_text(f"Step {k} of 5:  {m.group(2)}")
+            set_footer(m.group(2))
+        elif line.startswith("  ") and line.strip():
+            set_footer(line.strip())
+        return False
+
+    def on_exit(rc: int) -> bool:
+        state["proc"] = None
+        set_running(False)
+        out = Path(values["out"].strip()).expanduser()
+        if state["cancelled"]:
+            progress.hide()
+            refresh()
+            set_footer("Cancelled. Nothing was changed; you can start again.", "warn")
+            return False
+        if rc == 0:
+            progress.set_fraction(1.0)
+            progress.set_text("Finished")
+            extract_btn.hide()
+            exe = game_to_start(out)
+            if exe:
+                start_btn.show()
+                set_footer(f"Done! The game files are in {out}. Click Start MHGU Recomp to play.", "ok")
+            else:
+                set_footer(f"Done! The game files are in {out}.\n{build_hint(out)}", "ok")
+            state["exe"] = exe
+            return False
+        progress.hide()
+        refresh()
+        msg = output_error(state["lines"])
+        set_footer("Extraction failed: see the message.", "bad")
+        dlg = Gtk.MessageDialog(transient_for=win, modal=True, message_type=Gtk.MessageType.ERROR,
+                                buttons=Gtk.ButtonsType.CLOSE, text="Extraction failed")
+        dlg.format_secondary_text(msg)
+        dlg.run()
+        dlg.destroy()
+        return False
+
+    def reader(proc: subprocess.Popen) -> None:
+        for line in proc.stdout:
+            GLib.idle_add(on_line, line.rstrip("\n"))
+        GLib.idle_add(on_exit, proc.wait())
+
+    def do_extract(_btn) -> None:
+        refresh()
+        if gui_blockers(values) or hactool_error:
+            return
+        cmd = [sys.executable, "-u", str(Path(__file__).resolve()), "--cli",
+               "--base", values["base"].strip(), "--update", values["update"].strip(),
+               "--keys", values["keys"].strip(), "--out", values["out"].strip()]
+        if values["title"].strip():
+            cmd += ["--title-keys", values["title"].strip()]
+        state.update(cancelled=False, lines=[])
+        state["proc"] = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                         bufsize=1, errors="replace")
+        set_running(True)
+        threading.Thread(target=reader, args=(state["proc"],), daemon=True).start()
+
+    def do_cancel(_btn) -> None:
+        proc = state["proc"]
+        if proc and proc.poll() is None:
+            state["cancelled"] = True
+            cancel_btn.set_sensitive(False)
+            set_footer("Cancelling…")
+            proc.terminate()  # (the --cli child unwinds on SIGTERM: hactool stops, the work folder goes)
+
+    def do_start(_btn) -> None:
+        exe = state.get("exe")
+        if exe:
+            subprocess.Popen([str(exe)], cwd=str(exe.parent), start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            win.destroy()
+
+    def on_close(*_args) -> bool:
+        proc = state["proc"]
+        if proc and proc.poll() is None:
+            dlg = Gtk.MessageDialog(transient_for=win, modal=True, message_type=Gtk.MessageType.QUESTION,
+                                    buttons=Gtk.ButtonsType.YES_NO, text="Stop the extraction?")
+            dlg.format_secondary_text("It is still running. Stopping it leaves your NSP files as they are.")
+            answer = dlg.run()
+            dlg.destroy()
+            if answer != Gtk.ResponseType.YES:
+                return True
+            proc.terminate()
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        return False
+
+    extract_btn.connect("clicked", do_extract)
+    cancel_btn.connect("clicked", do_cancel)
+    start_btn.connect("clicked", do_start)
+    win.connect("delete-event", on_close)
+    win.connect("destroy", lambda *_: Gtk.main_quit())
+
+    refresh()
+    win.show_all()
+    Gtk.main()
+
+
+def run_tk() -> None:
+    """The window on Windows (and on Linux when GTK is missing): tkinter."""
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
     win = tk.Tk()
-    win.title("MHGU Recomp — Extract from NSP")
-    win.geometry("640x420")
-    win.minsize(520, 380)
+    win.title(WINDOW_TITLE)
+    win.geometry("780x760")
+    win.minsize(640, 640)
 
-    root = repo_root()
-    # Release zip: extract straight into data/ next to mhgurecomp. Source tree: mhgu_game/.
-    exe_name = "mhgurecomp.exe" if os.name == "nt" else "mhgurecomp"
-    default_out = root / "data" if (root / exe_name).is_file() else root / "mhgu_game"
-    paths: dict[str, tk.StringVar] = {
-        "base": tk.StringVar(),
-        "update": tk.StringVar(),
-        "keys": tk.StringVar(),
-        "title": tk.StringVar(),
-        "out": tk.StringVar(value=str(default_out)),
-    }
-    status = tk.StringVar(value="Pick your files, then click Extract.")
+    values: dict[str, tk.StringVar] = {key: tk.StringVar() for key, *_ in FIELDS}
+    values["out"].set(str(default_output()))
+    colors = {"ok": "#1e8a4c", "warn": "#a86b00", "bad": "#c01c28", "empty": "#777777"}
+    marks = {"ok": "✔", "warn": "⚠", "bad": "✖", "empty": "○"}
     busy = {"on": False}
+    status_labels: dict[str, ttk.Label] = {}
 
-    def browse_file(key: str, title: str, patterns: list[tuple[str, str]]) -> None:
-        p = filedialog.askopenfilename(parent=win, title=title, filetypes=patterns + [("All files", ALL_FILES)])
+    try:
+        hactool_error = ""
+        find_hactool()
+    except ExtractError as e:
+        hactool_error = str(e)
+
+    def current() -> dict[str, str]:
+        return {k: v.get() for k, v in values.items()}
+
+    def browse(key: str, kind: str, title: str) -> None:
+        if kind == "dir":
+            p = filedialog.askdirectory(parent=win, title=title, initialdir=values[key].get() or None)
+        else:
+            pats = [("NSP files", NSP_FILES)] if kind == "nsp" else [("Keys files", "*.keys")]
+            p = filedialog.askopenfilename(parent=win, title=title, filetypes=pats + [("All files", ALL_FILES)])
         if p:
-            paths[key].set(p)
+            values[key].set(p)
 
-    def browse_dir(key: str, title: str) -> None:
-        p = filedialog.askdirectory(parent=win, title=title)
-        if p:
-            paths[key].set(p)
+    frm = ttk.Frame(win, padding=14)
+    frm.pack(fill=tk.BOTH, expand=True)
+    ttk.Label(frm, text="Extract MHGU from NSP", font=("TkDefaultFont", 14, "bold")).pack(anchor=tk.W)
+    ttk.Label(frm, text=INTRO, wraplength=720, justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 10))
+    if hactool_error:
+        ttk.Label(frm, text=hactool_error, foreground=colors["bad"], wraplength=720,
+                  justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 8))
 
-    def set_status(msg: str) -> None:
-        win.after(0, lambda: status.set(msg))
+    for key, title, hint, kind, _required in FIELDS:
+        box = ttk.Frame(frm, padding=(0, 6))
+        box.pack(fill=tk.X)
+        head = ttk.Frame(box)
+        head.pack(fill=tk.X)
+        ttk.Label(head, text=title, font=("TkDefaultFont", 10, "bold")).pack(side=tk.LEFT)
+        ttk.Label(box, text=hint, foreground="#666666", wraplength=720, justify=tk.LEFT).pack(anchor=tk.W)
+        line = ttk.Frame(box)
+        line.pack(fill=tk.X, pady=(2, 0))
+        ttk.Entry(line, textvariable=values[key]).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(line, text="Choose folder…" if kind == "dir" else "Choose file…", width=14,
+                   command=lambda k=key, kd=kind, t=title: browse(k, kd, t.split("  ", 1)[-1])).pack(side=tk.RIGHT, padx=(6, 0))
+        st = ttk.Label(box, text="", wraplength=720, justify=tk.LEFT, font=("TkDefaultFont", 10, "bold"))
+        st.pack(anchor=tk.W, pady=(2, 0))
+        status_labels[key] = st
 
-    def finish_ok(msg: str) -> None:
-        busy["on"] = False
-        extract_btn.configure(state=tk.NORMAL)
-        status.set(msg)
-        messagebox.showinfo("Done", msg, parent=win)
+    progress = ttk.Progressbar(frm, maximum=5)
+    progress.pack(fill=tk.X, pady=(12, 4))
+    bottom = ttk.Frame(frm)
+    bottom.pack(fill=tk.X)
+    footer = ttk.Label(bottom, text="", wraplength=560, justify=tk.LEFT)
+    footer.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    extract_btn = ttk.Button(bottom, text="Extract", width=14)
+    extract_btn.pack(side=tk.RIGHT)
 
-    def finish_err(msg: str) -> None:
-        busy["on"] = False
-        extract_btn.configure(state=tk.NORMAL)
-        status.set("Failed.")
-        messagebox.showerror("Extract failed", msg, parent=win)
-
-    def do_extract() -> None:
+    def refresh(*_args) -> None:
         if busy["on"]:
             return
-        base = Path(paths["base"].get().strip())
-        update = Path(paths["update"].get().strip())
-        keys = Path(paths["keys"].get().strip())
-        out = Path(paths["out"].get().strip())
-        title_s = paths["title"].get().strip()
-        title_keys = Path(title_s) if title_s else None
+        vals = current()
+        for key, *_ in FIELDS:
+            level, text = check_field(key, vals)
+            status_labels[key].configure(text=f"{marks[level]}  {text}", foreground=colors[level])
+        level, text = gui_summary(vals)
+        extract_btn.configure(state=tk.NORMAL if level == "ok" and not hactool_error else tk.DISABLED)
+        if hactool_error:
+            footer.configure(text="✖  hactool is missing (see above): extracting needs it.", foreground=colors["bad"])
+        else:
+            footer.configure(text=f"{marks[level]}  {text}", foreground=colors[level])
 
-        if not base.is_file() or not update.is_file() or not keys.is_file():
-            messagebox.showwarning(
-                "Missing files",
-                "Please select:\n• Base game NSP\n• 1.4.0 update NSP\n• prod.keys",
-                parent=win,
-            )
-            return
-        if not str(out):
-            messagebox.showwarning("Missing folder", "Choose where to put exefs and romfs.", parent=win)
-            return
+    for v in values.values():
+        v.trace_add("write", refresh)
 
+    def set_progress(msg: str) -> None:
+        def apply() -> None:
+            m = STEP_RE.match(msg)
+            if m:
+                progress.configure(value=int(m.group(1)) - 1)
+                footer.configure(text=f"Step {m.group(1)} of 5:  {m.group(2)}", foreground="")
+            elif msg.startswith("  ") and msg.strip():
+                footer.configure(text=msg.strip(), foreground="")
+        win.after(0, apply)
+
+    def finish(ok: bool, msg: str, out: Path) -> None:
+        busy["on"] = False
+        if ok:
+            progress.configure(value=5)
+            exe = game_to_start(out)
+            footer.configure(text=f"✔  Done! The game files are in {out}.", foreground=colors["ok"])
+            extract_btn.configure(state=tk.DISABLED)
+            if exe and messagebox.askyesno("Done", f"The game files are in:\n{out}\n\nStart MHGU Recomp now?", parent=win):
+                subprocess.Popen([str(exe)], cwd=str(exe.parent))
+                win.destroy()
+            elif not exe:
+                messagebox.showinfo("Done", f"The game files are in:\n{out}\n\n{build_hint(out)}", parent=win)
+        else:
+            progress.configure(value=0)
+            refresh()
+            footer.configure(text="✖  Extraction failed: see the message.", foreground=colors["bad"])
+            messagebox.showerror("Extraction failed", msg, parent=win)
+
+    def do_extract() -> None:
+        vals = current()
+        if busy["on"] or gui_blockers(vals) or hactool_error:
+            return
+        out = Path(vals["out"].strip()).expanduser()
+        title_keys = Path(vals["title"].strip()) if vals["title"].strip() else None
         busy["on"] = True
         extract_btn.configure(state=tk.DISABLED)
-        status.set("Starting…")
+        footer.configure(text="Starting…", foreground="")
 
         def worker() -> None:
             try:
-                extract_mhgu(base, update, keys, out, title_keys, progress=set_status)
-                install = install_into_build_data(out)
-                finish_ok(f"Extraction finished.\n\nOutput:\n{out}\n\n{install or build_hint(out)}")
+                extract_mhgu(Path(vals["base"].strip()), Path(vals["update"].strip()), Path(vals["keys"].strip()),
+                             out, title_keys, progress=set_progress)
+                win.after(0, lambda: finish(True, "", out))
             except ExtractError as e:
-                finish_err(str(e))
+                win.after(0, lambda m=str(e): finish(False, m, out))
             except Exception:
-                finish_err(traceback.format_exc()[-2000:])
+                win.after(0, lambda m=traceback.format_exc()[-2000:]: finish(False, m, out))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    pad = {"padx": 12, "pady": 4}
-    frm = ttk.Frame(win, padding=12)
-    frm.pack(fill=tk.BOTH, expand=True)
-
-    ttk.Label(
-        frm,
-        text="Extract Monster Hunter Generations Ultimate 1.4.0 from NSP files.\n"
-        "You need the base game NSP, the 1.4.0 update NSP, and your own prod.keys.\n"
-        "About 20 GB free space is required. Original NSPs are not changed.",
-        justify=tk.LEFT,
-    ).pack(anchor=tk.W, pady=(0, 10))
-
-    rows = ttk.Frame(frm)
-    rows.pack(fill=tk.X)
-
-    def add_row(label: str, key: str, browse) -> None:
-        r = ttk.Frame(rows)
-        r.pack(fill=tk.X, pady=3)
-        ttk.Label(r, text=label, width=18).pack(side=tk.LEFT)
-        ttk.Entry(r, textvariable=paths[key]).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
-        ttk.Button(r, text="Browse…", width=10, command=browse).pack(side=tk.RIGHT)
-
-    add_row("Base game NSP", "base", lambda: browse_file("base", "Select base game NSP", [("NSP", NSP_FILES)]))
-    add_row("1.4.0 update NSP", "update", lambda: browse_file("update", "Select 1.4.0 update NSP", [("NSP", NSP_FILES)]))
-    add_row("prod.keys", "keys", lambda: browse_file("keys", "Select prod.keys", [("Keys", "*.keys")]))
-    add_row("title.keys (optional)", "title", lambda: browse_file("title", "Select title.keys (optional)", [("Keys", "*.keys")]))
-    add_row("Output folder", "out", lambda: browse_dir("out", "Select output folder"))
-
-    extract_btn = ttk.Button(frm, text="Extract", command=do_extract)
-    extract_btn.pack(pady=14)
-
-    ttk.Label(frm, textvariable=status, wraplength=600, justify=tk.LEFT).pack(anchor=tk.W, fill=tk.X)
-
-    # hactool hint
-    try:
-        find_hactool()
-    except ExtractError as e:
-        status.set(str(e))
-
+    extract_btn.configure(command=do_extract)
+    refresh()
     win.mainloop()
+
+
+def run_gui() -> None:
+    """GTK on Linux desktops (looks native, ships with them), else tkinter."""
+    if os.name != "nt" and gtk_available():
+        try:
+            run_gtk()
+            return
+        except RuntimeError:
+            pass  # (no display for GTK: try Tk, which reports its own error)
+    run_tk()
 
 
 def run_cli(argv: list[str] | None = None) -> int:
@@ -564,7 +1031,7 @@ def run_cli(argv: list[str] | None = None) -> int:
     try:
         extract_mhgu(args.base, args.update, args.keys, args.out, args.title_keys)
     except ExtractError as e:
-        print(e, file=sys.stderr)
+        print(f"Error: {e}", file=sys.stderr)  # (the GTK window shows what follows "Error: ")
         return 1
     return 0
 

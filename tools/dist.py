@@ -20,7 +20,7 @@ import zipfile
 DATA_NOTE = ('Put your own dump of Monster Hunter Generations Ultimate 1.4.0 here: the exefs and romfs folders\n'
              '(data/exefs/main, data/romfs/...). Or extract them from your NSPs: run Extract MHGU NSP.bat\n'
              '(Windows, needs Python 3.10+ with tkinter) or Extract MHGU NSP.sh (Linux, needs Python 3.10+ and\n'
-             'tkinter, zenity or kdialog) with your base game NSP, 1.4.0 update NSP, and prod.keys; choose this\n'
+             'GTK or tkinter) with your base game NSP, 1.4.0 update NSP, and prod.keys; choose this\n'
              'data folder as output. hactool is shipped beside the program. Original NSPs are not modified.\n')
 
 

@@ -79,7 +79,7 @@ Necesitas Monster Hunter Generations Ultimate **1.4.0**. En Windows y Linux pued
 
 1. Extrae el zip donde quieras. Deja `hactool` junto a `mhgurecomp`.
 2. Ten listos: NSP base, NSP actualización **1.4.0**, y tu `prod.keys` (no lo compartas).
-3. Ejecuta **Extract MHGU NSP.bat** (Windows; Python 3.10+ con tkinter) o **Extract MHGU NSP.sh** (Linux; clic derecho → *Ejecutar como programa*, o `./"Extract MHGU NSP.sh"` en una terminal; Python 3.10+ y tkinter, zenity o kdialog), elige esos archivos y como salida la carpeta `data\` de la versión. Hace falta unos **20 GB libres**; los NSP no se modifican.
+3. Ejecuta **Extract MHGU NSP.bat** (Windows; Python 3.10+ con tkinter) o **Extract MHGU NSP.sh** (Linux; clic derecho → *Ejecutar como programa*, o `./"Extract MHGU NSP.sh"` en una terminal; Python 3.10+; la ventana usa GTK, incluido en las distribuciones de escritorio, o tkinter), elige esos archivos y como salida la carpeta `data\` de la versión. Hace falta unos **20 GB libres**; los NSP no se modifican.
 4. Inicia `mhgurecomp.exe`.
 
 (Opcional) Con `MHGU_NSP_IMPORT=1` se usan los selectores NSP de la app.
