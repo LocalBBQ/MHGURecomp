@@ -120,15 +120,15 @@ def import_tickets(hactool: Path, keys: Path, home: Path, nsp_dir: Path, sample_
             rights, enc = parsed
             if first_enc is None:
                 first_enc = enc
-            # Probe that prod.keys can unwrap this ticket (optional sanity check).
+            # Always record the encrypted titlekey (needed for --basenca merges). Probe is optional.
+            tk.write(f"{rights}={enc}\n")
             r = run(hactool, keys, home, f"--titlekey={enc}", "-t", "nca", str(nca), check=False)
             text = (r.stdout or "") + (r.stderr or "")
             ok = any("titlekey (decrypted)" in line.lower() for line in text.splitlines())
             if ok:
-                tk.write(f"{rights}={enc}\n")
                 print(f"  imported titlekey for {rights[:16]}…")
             else:
-                print(f"  warning: could not verify titlekey for {rights[:16]}…")
+                print(f"  imported titlekey for {rights[:16]}… (could not verify against sample NCA)")
     return first_enc
 
 
@@ -235,7 +235,13 @@ def extract_mhgu(
             f"Not enough free space.\nNeed about 20 GB free (have {free / 1024**3:.1f} GB)."
         )
 
-    work = Path(tempfile.mkdtemp(prefix="mhgu_nsp_"))
+    # Prefer the output drive over /tmp: base NSP unpack alone is ~12 GB, and tmpfs is often smaller.
+    work_root = out.resolve().parent
+    try:
+        work_root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        work_root = Path(tempfile.gettempdir())
+    work = Path(tempfile.mkdtemp(prefix="mhgu_nsp_", dir=str(work_root)))
     try:
         home, keyfile = setup_keys(work, keys, title_keys)
         base_dir = work / "base_nsp"
